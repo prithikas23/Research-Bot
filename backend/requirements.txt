@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+chromadb
+pydantic
+python-dotenv
+python-multipart
+pymupdf
+sqlalchemy
+psycopg2-binary
