@@ -216,3 +216,16 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Research Paper Answer Bot
+.env
+backend/.env
+frontend/.env
+venv/
+backend/venv/
+backend/chroma_db/
+backend/uploads/papers/
+node_modules/
+frontend/node_modules/
+dist/
+frontend/dist/

@@ -1,8 +1,17 @@
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
+from app.core.config import settings
 from app.services.vector_service import add_documents, search_documents, collection_count
+from app.api.documents import router as documents_router
+from app.api.conversations import router as conversations_router
+from app.api.chat import router as chat_router
 
 router = APIRouter()
+
+# Include sub-routers
+router.include_router(documents_router)
+router.include_router(conversations_router)
+router.include_router(chat_router)
 
 
 class AddDocumentsRequest(BaseModel):
@@ -20,7 +29,7 @@ class SearchRequest(BaseModel):
 @router.get("/chroma/status")
 def chroma_status():
     return {
-        "collection": "research_papers",
+        "collection": settings.CHROMA_COLLECTION,
         "document_count": collection_count()
     }
 
