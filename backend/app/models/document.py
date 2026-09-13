@@ -13,7 +13,7 @@ class Document(Base):
     file_path = Column(Text, nullable=False)
     file_size = Column(BigInteger, nullable=True)
     page_count = Column(Integer, nullable=True)
-    status = Column(String(20), nullable=False, default="uploaded")
+    status = Column(String(20), nullable=False, default="not_refreshed")
     created_at = Column(DateTime, server_default=func.now(), default=datetime.utcnow)
 
     # Relationship to message sources

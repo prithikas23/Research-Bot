@@ -7,7 +7,7 @@ class DocumentBase(BaseModel):
     stored_filename: str
     file_size: int | None = None
     page_count: int | None = None
-    status: str = "uploaded"
+    status: str = "not_refreshed"
 
 
 class DocumentResponse(DocumentBase):

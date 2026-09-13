@@ -17,7 +17,8 @@ from app.services.vector_service import add_documents, delete_document_chunks
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/documents", tags=["documents"])
+# Router defined without fixed prefix so it can be mounted under both /documents and /files
+router = APIRouter(tags=["documents"])
 
 
 @router.post("/upload", response_model=DocumentUploadResponse, status_code=status.HTTP_201_CREATED)
@@ -25,6 +26,14 @@ async def upload_document(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
+    """
+    Upload PDF document:
+    - Validates file format and size.
+    - Saves locally to disk.
+    - Inspects page count.
+    - Creates database record with status 'not_refreshed'.
+    - Does NOT index into ChromaDB until explicitly refreshed.
+    """
     # 1. Validate PDF file type
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(
@@ -62,35 +71,75 @@ async def upload_document(
     with open(file_path, "wb") as f:
         f.write(contents)
 
-    # 5. Create document DB record with status 'processing'
+    # 5. Extract page count from PDF
+    page_count = 0
+    try:
+        meta = pdf_service.get_pdf_metadata(file_path)
+        page_count = meta.get("page_count", 0)
+    except Exception as e:
+        logger.warning(f"Could not read PDF metadata for {file.filename}: {e}")
+
+    # 6. Create document DB record with status 'not_refreshed'
     db_document = Document(
         original_filename=file.filename,
         stored_filename=stored_filename,
         file_path=str(file_path),
         file_size=file_size,
-        status="processing",
+        page_count=page_count,
+        status="not_refreshed",
     )
     db.add(db_document)
     db.commit()
     db.refresh(db_document)
 
+    return DocumentUploadResponse(
+        message="File uploaded successfully. Click Refresh to index it for chat.",
+        document=db_document,
+    )
+
+
+@router.post("/{document_id}/refresh", response_model=DocumentUploadResponse, status_code=status.HTTP_200_OK)
+def refresh_document(
+    document_id: int,
+    db: Session = Depends(get_db),
+):
+    """
+    Explicitly chunk, embed, and index a document into ChromaDB.
+    Updates document status to 'refreshed'.
+    """
+    doc = db.query(Document).filter(Document.id == document_id).first()
+    if not doc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
+
+    local_path = Path(doc.file_path)
+    if not local_path.exists():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="PDF file not found on disk.")
+
+    doc.status = "refreshing"
+    db.commit()
+    db.refresh(doc)
+
     try:
-        # 6. Extract PDF pages and metadata
-        meta = pdf_service.get_pdf_metadata(file_path)
+        # Extract metadata and pages
+        meta = pdf_service.get_pdf_metadata(local_path)
         page_count = meta.get("page_count", 0)
-        paper_title = meta.get("title") or Path(file.filename).stem
+        paper_title = meta.get("title") or Path(doc.original_filename).stem
 
-        pages_data = pdf_service.extract_pages(file_path)
+        pages_data = pdf_service.extract_pages(local_path)
+        actual_pages = len(pages_data) if pages_data else page_count
 
-        # 7. Create page-aware chunks
+        # Create page-aware chunks
         chunks = chunking_service.create_page_aware_chunks(
             pages_data=pages_data,
-            document_id=db_document.id,
+            document_id=doc.id,
             paper_title=paper_title,
-            source_file=file.filename,
+            source_file=doc.original_filename,
         )
 
-        # 8. Generate embeddings and store in ChromaDB
+        # Remove existing vectors in ChromaDB for this document to avoid duplication
+        delete_document_chunks(doc.id)
+
+        # Generate embeddings and store in ChromaDB
         if chunks:
             chunk_texts = [c["text"] for c in chunks]
             chunk_ids = [c["id"] for c in chunks]
@@ -104,25 +153,25 @@ async def upload_document(
                 embeddings=embeddings,
             )
 
-        # 9. Update DB record to completed
-        db_document.page_count = page_count
-        db_document.status = "completed"
+        # Update DB record to 'refreshed'
+        doc.page_count = actual_pages
+        doc.status = "refreshed"
         db.commit()
-        db.refresh(db_document)
+        db.refresh(doc)
 
         return DocumentUploadResponse(
-            message=f"Successfully processed and indexed {page_count} pages ({len(chunks)} chunks).",
-            document=db_document,
+            message=f"Successfully indexed {actual_pages} pages ({len(chunks)} chunks).",
+            document=doc,
         )
 
     except Exception as e:
-        logger.error(f"Failed to process document {db_document.id}: {e}", exc_info=True)
-        db_document.status = "failed"
+        logger.error(f"Failed to refresh document {doc.id}: {e}", exc_info=True)
+        doc.status = "failed"
         db.commit()
-        db.refresh(db_document)
+        db.refresh(doc)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to process research paper PDF: {str(e)}",
+            detail=f"Failed to refresh and index document: {str(e)}",
         )
 
 

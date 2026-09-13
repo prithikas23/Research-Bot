@@ -92,7 +92,14 @@ def run_tests():
     print("Uploaded document ID:", doc_id)
     print("Status message:", upload_data["message"])
     assert upload_data["document"]["page_count"] == 3
-    assert upload_data["document"]["status"] == "completed"
+    assert upload_data["document"]["status"] == "not_refreshed"
+
+    print("\n--- 2b. Explicitly Refresh Document for Indexing ---")
+    refresh_res = client.post(f"/api/documents/{doc_id}/refresh")
+    assert refresh_res.status_code == 200, f"Refresh failed: {refresh_res.text}"
+    refresh_data = refresh_res.json()
+    assert refresh_data["document"]["status"] == "refreshed"
+    print("Refresh message:", refresh_data["message"])
 
     print("\n--- 3. Testing Documents Listing ---")
     docs_res = client.get("/api/documents")
@@ -121,7 +128,8 @@ def run_tests():
     chat_res = client.post("/api/chat", json=chat_payload)
     assert chat_res.status_code == 200, f"Chat failed: {chat_res.text}"
     chat_data = chat_res.json()
-    print("\nQuestion 1 Answer:\n", chat_data["answer"])
+    ans1_safe = chat_data["answer"][:100].encode("ascii", "replace").decode("ascii")
+    print("\nQuestion 1 Answer:\n", ans1_safe)
     print("\nQuestion 1 Sources:")
     for s in chat_data["sources"]:
         print(f"  Rank {s['rank']} | Page {s['page_number']} | Score {s['score']} | {s['paper_title']}")
@@ -136,7 +144,8 @@ def run_tests():
     chat_res2 = client.post("/api/chat", json=chat_payload2)
     assert chat_res2.status_code == 200
     chat_data2 = chat_res2.json()
-    print("\nQuestion 2 Answer:\n", chat_data2["answer"])
+    ans2_safe = chat_data2["answer"][:100].encode("ascii", "replace").decode("ascii")
+    print("\nQuestion 2 Answer:\n", ans2_safe)
     print("\nQuestion 2 Sources:")
     for s in chat_data2["sources"]:
         print(f"  Rank {s['rank']} | Page {s['page_number']} | Score {s['score']} | {s['paper_title']}")
@@ -150,7 +159,8 @@ def run_tests():
     chat_res3 = client.post("/api/chat", json=chat_payload3)
     assert chat_res3.status_code == 200
     chat_data3 = chat_res3.json()
-    print("\nQuestion 3 Answer (Missing context test):\n", chat_data3["answer"])
+    ans3_safe = chat_data3["answer"][:100].encode("ascii", "replace").decode("ascii")
+    print("\nQuestion 3 Answer (Missing context test):\n", ans3_safe)
 
     print("\n--- 9. Verify PostgreSQL Records in messages and message_sources ---")
     with SessionLocal() as db:

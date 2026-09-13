@@ -2,19 +2,30 @@ import logging
 from abc import ABC, abstractmethod
 import httpx
 from app.core.config import settings
+from app.services.greeting_service import detect_greeting
 
 logger = logging.getLogger(__name__)
 
 GROUNDED_SYSTEM_PROMPT = (
-    "You are a research paper question-answering assistant.\n"
-    "Answer the user's question using only the supplied research-paper context.\n"
-    "Do not invent facts, citations, paper titles, page numbers, or sources.\n"
-    "If the supplied context does not contain enough information to answer the question, say:\n"
+    "You are Research Bot, a dedicated AI research paper assistant.\n\n"
+    "IDENTITY & CONVERSATIONAL RULES:\n"
+    "- Your name is always Research Bot. Never assume the identity of any author, student, researcher, or person mentioned in the uploaded documents.\n"
+    "- If the user asks who you are or what your name is, introduce yourself as Research Bot.\n"
+    "- If the user's message begins with a greeting followed by a research question (e.g., 'Good morning, what is diabetes?' or 'Hi, explain cardiovascular disease.'), acknowledge the greeting naturally (e.g., 'Good morning! ...' or 'Hello! ...') and then answer the research question strictly using the supplied research context.\n\n"
+    "GROUNDED ANSWERING RULES:\n"
+    "- Answer the user's research questions using only the supplied research-paper context.\n"
+    "- Do not invent facts, citations, paper titles, page numbers, or sources.\n"
+    "- If the supplied context does not contain enough information to answer a research question, say:\n"
     "\"I could not find sufficient information about this in the uploaded research papers.\"\n"
-    "Be concise but informative.\n"
-    "Use the conversation history only to understand the user's question.\n"
-    "Do not use unsupported external knowledge."
+    "- Be concise, clear, and informative.\n"
+    "- Use the conversation history only to understand the user's question.\n"
+    "- Do not use unsupported external knowledge."
 )
+
+
+def check_greeting_or_identity(query: str) -> str | None:
+    """Delegate to modular greeting_service."""
+    return detect_greeting(query)
 
 
 class BaseLLMService(ABC):
@@ -79,12 +90,20 @@ class GroqLLMService(BaseLLMService):
         messages.append({"role": "user", "content": user_content})
         return messages
 
+    def check_greeting_or_identity(self, query: str) -> str | None:
+        return detect_greeting(query)
+
     def generate_answer(
         self,
         query: str,
         context_chunks: list[str],
         conversation_history: list[dict] | None = None,
     ) -> str:
+        # Check greetings and identity questions first
+        preset = self.check_greeting_or_identity(query)
+        if preset:
+            return preset
+
         if not self.api_key:
             raise ValueError("GROQ_API_KEY is not configured.")
 

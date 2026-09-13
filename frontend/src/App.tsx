@@ -1,322 +1,412 @@
-import { useState, useEffect, useRef } from "react";
-import axios from "axios";
+import React, { useState, useEffect, useRef } from "react";
 import ReactMarkdown from "react-markdown";
 import type {
-  ChatResponse,
-  Source,
-  UploadResponse,
-  DocumentItem,
-  ConversationItem,
-  MessageItem,
+  FileItem,
+  ChatMessage,
+  ChatConversation,
 } from "./types";
+import { getFiles, uploadFile, refreshFile, deleteFile } from "./api/files";
+import { askQuestion } from "./api/chat";
+import {
+  loadChatHistory,
+  saveChatHistory,
+  generateChatTitle,
+} from "./utils/storage";
 
-const API_BASE_URL =
-  import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000/api";
+function formatBytes(bytes?: number): string {
+  if (!bytes) return "0 KB";
+  const kb = bytes / 1024;
+  if (kb < 1024) return `${Math.round(kb)} KB`;
+  return `${(kb / 1024).toFixed(1)} MB`;
+}
 
-const api = axios.create({
-  baseURL: API_BASE_URL,
-});
+export default function App() {
+  // Navigation: "chat" | "files"
+  const [currentTab, setCurrentTab] = useState<"chat" | "files">("chat");
+  const [sidebarOpen, setSidebarOpen] = useState<boolean>(false);
 
-function App() {
-  // Document state
-  const [file, setFile] = useState<File | null>(null);
-  const [documents, setDocuments] = useState<DocumentItem[]>([]);
+  // Files state
+  const [files, setFiles] = useState<FileItem[]>([]);
+  const [refreshingIds, setRefreshingIds] = useState<Set<number>>(new Set());
   const [isUploading, setIsUploading] = useState<boolean>(false);
-  const [uploadStatus, setUploadStatus] = useState<string>("");
-
-  // Conversation & Chat state
-  const [conversations, setConversations] = useState<ConversationItem[]>([]);
-  const [activeConvId, setActiveConvId] = useState<number | null>(null);
-  const [messages, setMessages] = useState<MessageItem[]>([]);
-  const [question, setQuestion] = useState<string>("");
-  const [loading, setLoading] = useState<boolean>(false);
-
-  // Backend Health state
-  const [backendStatus, setBackendStatus] = useState<{
-    status: string;
-    database?: string;
-    chroma?: string;
+  const [uploadFeedback, setUploadFeedback] = useState<{
+    type: "success" | "error" | "info";
+    message: string;
   } | null>(null);
+  const [isDragging, setIsDragging] = useState<boolean>(false);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  // Chat & History state (persisted via localStorage)
+  const [conversations, setConversations] = useState<ChatConversation[]>([]);
+  const [activeConvId, setActiveConvId] = useState<string | null>(null);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [question, setQuestion] = useState<string>("");
+  const [isThinking, setIsThinking] = useState<boolean>(false);
 
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
 
-  // Initial load
+  // Load files from backend & chat history from localStorage on initial render
   useEffect(() => {
-    checkBackend();
-    fetchDocuments();
-    fetchConversations();
+    loadFiles();
+    const saved = loadChatHistory();
+    setConversations(saved);
+    if (saved.length > 0) {
+      setActiveConvId(saved[0].id);
+      setMessages(saved[0].messages || []);
+    }
   }, []);
 
-  // Auto-scroll messages
+  // Auto-scroll chat to bottom
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, loading]);
-
-  // Load conversation details when active conversation changes
-  useEffect(() => {
-    if (activeConvId) {
-      loadConversationMessages(activeConvId);
-    } else {
-      setMessages([]);
+    if (currentTab === "chat") {
+      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
     }
-  }, [activeConvId]);
+  }, [messages, isThinking, currentTab]);
 
-  async function checkBackend(): Promise<void> {
+  // Refreshed files count for status indicator & header
+  const refreshedCount = files.filter(
+    (f) => f.status === "refreshed" || f.status === "completed"
+  ).length;
+
+  async function loadFiles() {
     try {
-      const response = await api.get<{
-        status: string;
-        database?: string;
-        chroma?: string;
-      }>("/health");
-      setBackendStatus(response.data);
-    } catch {
-      setBackendStatus({ status: "offline", database: "disconnected", chroma: "disconnected" });
+      const data = await getFiles();
+      setFiles(data);
+    } catch (err: unknown) {
+      console.error("Failed to load files:", err);
     }
   }
 
-  async function fetchDocuments(): Promise<void> {
-    try {
-      const response = await api.get<DocumentItem[]>("/documents");
-      setDocuments(response.data);
-    } catch (err) {
-      console.error("Failed to fetch documents:", err);
-    }
-  }
-
-  async function fetchConversations(): Promise<void> {
-    try {
-      const response = await api.get<ConversationItem[]>("/conversations");
-      setConversations(response.data);
-      if (!activeConvId && response.data.length > 0) {
-        setActiveConvId(response.data[0].id);
-      }
-    } catch (err) {
-      console.error("Failed to fetch conversations:", err);
-    }
-  }
-
-  async function loadConversationMessages(convId: number): Promise<void> {
-    try {
-      const response = await api.get<{ messages: MessageItem[] }>(`/conversations/${convId}`);
-      setMessages(response.data.messages || []);
-    } catch (err) {
-      console.error(`Failed to load messages for conversation ${convId}:`, err);
-    }
-  }
-
-  async function handleCreateNewConversation(): Promise<void> {
-    try {
-      const response = await api.post<ConversationItem>("/conversations", {
-        title: "New Research Discussion",
+  // Handle uploading PDF
+  async function handleFileSelect(selectedFile: File) {
+    if (!selectedFile.name.toLowerCase().endsWith(".pdf")) {
+      setUploadFeedback({
+        type: "error",
+        message: "Only PDF files are supported.",
       });
-      setConversations([response.data, ...conversations]);
-      setActiveConvId(response.data.id);
-      setMessages([]);
-    } catch (err) {
-      console.error("Failed to create conversation:", err);
-    }
-  }
-
-  async function handleDeleteConversation(convId: number, e: React.MouseEvent): Promise<void> {
-    e.stopPropagation();
-    try {
-      await api.delete(`/conversations/${convId}`);
-      const updated = conversations.filter((c) => c.id !== convId);
-      setConversations(updated);
-      if (activeConvId === convId) {
-        setActiveConvId(updated.length > 0 ? updated[0].id : null);
-      }
-    } catch (err) {
-      console.error("Failed to delete conversation:", err);
-    }
-  }
-
-  async function handleDeleteDocument(docId: number): Promise<void> {
-    try {
-      await api.delete(`/documents/${docId}`);
-      setDocuments(documents.filter((d) => d.id !== docId));
-      setUploadStatus("Document deleted successfully.");
-    } catch (err) {
-      console.error("Failed to delete document:", err);
-      setUploadStatus("Failed to delete document.");
-    }
-  }
-
-  async function uploadFile(): Promise<void> {
-    if (!file) {
-      setUploadStatus("Please select a research paper PDF first.");
       return;
     }
 
-    const formData = new FormData();
-    formData.append("file", file);
-
     setIsUploading(true);
-    setUploadStatus("Uploading and extracting page chunks into ChromaDB...");
+    setUploadFeedback({
+      type: "info",
+      message: `Uploading ${selectedFile.name}...`,
+    });
 
     try {
-      const response = await api.post<UploadResponse>("/documents/upload", formData);
-      setUploadStatus(response.data.message || "Paper indexed successfully!");
-      setFile(null);
-      await fetchDocuments();
-    } catch (error: unknown) {
-      if (axios.isAxiosError(error)) {
-        setUploadStatus(error.response?.data?.detail || "Upload failed.");
-      } else {
-        setUploadStatus("Upload encountered an unexpected error.");
-      }
+      const newDoc = await uploadFile(selectedFile);
+      setFiles((prev) => [newDoc, ...prev.filter((f) => f.id !== newDoc.id)]);
+      setUploadFeedback({
+        type: "success",
+        message: `"${selectedFile.name}" uploaded. Click "Refresh" to index it for chat.`,
+      });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "Failed to upload file.";
+      setUploadFeedback({ type: "error", message: msg });
     } finally {
       setIsUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
     }
   }
 
-  async function askQuestion(e?: React.FormEvent): Promise<void> {
-    if (e) e.preventDefault();
-    const cleanQuestion = question.trim();
-    if (!cleanQuestion || loading) return;
-
-    const userMessage: MessageItem = {
-      id: Date.now(),
-      conversation_id: activeConvId || 0,
-      role: "user",
-      content: cleanQuestion,
-      created_at: new Date().toISOString(),
-    };
-
-    setMessages((prev) => [...prev, userMessage]);
-    setQuestion("");
-    setLoading(true);
+  // Handle refreshing / indexing file
+  async function handleRefresh(fileId: number) {
+    setRefreshingIds((prev) => new Set(prev).add(fileId));
+    setFiles((prev) =>
+      prev.map((f) => (f.id === fileId ? { ...f, status: "refreshing" } : f))
+    );
 
     try {
-      const response = await api.post<ChatResponse>("/chat", {
-        conversation_id: activeConvId,
-        question: cleanQuestion,
+      const updated = await refreshFile(fileId);
+      setFiles((prev) =>
+        prev.map((f) => (f.id === fileId ? updated : f))
+      );
+      setUploadFeedback({
+        type: "success",
+        message: `Indexed "${updated.original_filename}" into ChromaDB successfully!`,
       });
-
-      const newConvId = response.data.conversation_id;
-      if (!activeConvId && newConvId) {
-        setActiveConvId(newConvId);
-        await fetchConversations();
-      }
-
-      const assistantMessage: MessageItem = {
-        id: Date.now() + 1,
-        conversation_id: newConvId,
-        role: "assistant",
-        content: response.data.answer || "No answer generated.",
-        created_at: new Date().toISOString(),
-        sources: response.data.sources || [],
-      };
-
-      setMessages((prev) => [...prev, assistantMessage]);
-    } catch (error: unknown) {
-      const errorText = axios.isAxiosError(error)
-        ? error.response?.data?.detail || "Chat request failed."
-        : "Failed to connect to backend.";
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: Date.now() + 1,
-          conversation_id: activeConvId || 0,
-          role: "assistant",
-          content: `⚠️ ${errorText}`,
-          created_at: new Date().toISOString(),
-          sources: [],
-        },
-      ]);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "Refresh failed.";
+      setFiles((prev) =>
+        prev.map((f) => (f.id === fileId ? { ...f, status: "failed" } : f))
+      );
+      setUploadFeedback({ type: "error", message: msg });
     } finally {
-      setLoading(false);
+      setRefreshingIds((prev) => {
+        const next = new Set(prev);
+        next.delete(fileId);
+        return next;
+      });
     }
   }
 
-  const sampleQuestions = [
-    "What is Retrieval Augmented Generation?",
-    "What is the role of attention in Transformers?",
-    "How does RAG improve LLM responses?",
-    "What are the main limitations and future work suggested?",
-  ];
+  // Handle deleting file
+  async function handleDeleteFile(fileId: number) {
+    const target = files.find((f) => f.id === fileId);
+    if (!target) return;
+
+    try {
+      await deleteFile(fileId);
+      setFiles((prev) => prev.filter((f) => f.id !== fileId));
+      setUploadFeedback({
+        type: "info",
+        message: `"${target.original_filename}" deleted.`,
+      });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "Delete failed.";
+      setUploadFeedback({ type: "error", message: msg });
+    }
+  }
+
+  // Start a new chat
+  function handleNewChat() {
+    // If current conversation has messages and wasn't saved, save it
+    if (activeConvId && messages.length > 0) {
+      persistConversation(activeConvId, messages);
+    }
+    setActiveConvId(null);
+    setMessages([]);
+    setQuestion("");
+    setCurrentTab("chat");
+    setSidebarOpen(false);
+  }
+
+  // Select an existing conversation from history
+  function handleSelectConversation(conv: ChatConversation) {
+    // Persist previous if dirty
+    if (activeConvId && activeConvId !== conv.id && messages.length > 0) {
+      persistConversation(activeConvId, messages);
+    }
+    setActiveConvId(conv.id);
+    setMessages(conv.messages || []);
+    setCurrentTab("chat");
+    setSidebarOpen(false);
+  }
+
+  // Delete conversation from history
+  function handleDeleteConversation(id: string, e: React.MouseEvent) {
+    e.stopPropagation();
+    const updated = conversations.filter((c) => c.id !== id);
+    setConversations(updated);
+    saveChatHistory(updated);
+
+    if (activeConvId === id) {
+      if (updated.length > 0) {
+        setActiveConvId(updated[0].id);
+        setMessages(updated[0].messages || []);
+      } else {
+        setActiveConvId(null);
+        setMessages([]);
+      }
+    }
+  }
+
+  // Helper to persist conversation to state & localStorage
+  function persistConversation(convId: string, msgs: ChatMessage[]) {
+    setConversations((prev) => {
+      const existingIdx = prev.findIndex((c) => c.id === convId);
+      let updated: ChatConversation[];
+      const firstUserMsg = msgs.find((m) => m.role === "user")?.content || "";
+      const title = firstUserMsg ? generateChatTitle(firstUserMsg) : "New chat";
+
+      if (existingIdx >= 0) {
+        updated = [...prev];
+        updated[existingIdx] = {
+          ...updated[existingIdx],
+          title: updated[existingIdx].title || title,
+          updatedAt: new Date().toISOString(),
+          messages: msgs,
+        };
+      } else {
+        const newConv: ChatConversation = {
+          id: convId,
+          title,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          messages: msgs,
+        };
+        updated = [newConv, ...prev];
+      }
+      saveChatHistory(updated);
+      return updated;
+    });
+  }
+
+  // Send a question to RAG
+  async function handleSendQuestion(e?: React.FormEvent) {
+    if (e) e.preventDefault();
+    const cleanQuestion = question.trim();
+    if (!cleanQuestion || isThinking) return;
+
+    // Resolve or create conversation ID
+    const currentConvId = activeConvId || `chat_${Date.now()}`;
+    if (!activeConvId) {
+      setActiveConvId(currentConvId);
+    }
+
+    const userMsg: ChatMessage = {
+      id: `msg_${Date.now()}`,
+      role: "user",
+      content: cleanQuestion,
+      timestamp: new Date().toISOString(),
+    };
+
+    const newMessages = [...messages, userMsg];
+    setMessages(newMessages);
+    setQuestion("");
+    setIsThinking(true);
+
+    try {
+      const response = await askQuestion(cleanQuestion);
+
+      const assistantMsg: ChatMessage = {
+        id: `msg_${Date.now() + 1}`,
+        role: "assistant",
+        content: response.answer || "No response received.",
+        timestamp: new Date().toISOString(),
+        sources: response.sources || [],
+      };
+
+      const finalMessages = [...newMessages, assistantMsg];
+      setMessages(finalMessages);
+      persistConversation(currentConvId, finalMessages);
+    } catch (err: unknown) {
+      const errorMsg =
+        err instanceof Error
+          ? err.message
+          : "Could not generate an answer. Please try again.";
+
+      const assistantErrorMsg: ChatMessage = {
+        id: `msg_${Date.now() + 1}`,
+        role: "assistant",
+        content: `⚠️ ${errorMsg}`,
+        timestamp: new Date().toISOString(),
+        sources: [],
+      };
+
+      const finalMessages = [...newMessages, assistantErrorMsg];
+      setMessages(finalMessages);
+      persistConversation(currentConvId, finalMessages);
+    } finally {
+      setIsThinking(false);
+    }
+  }
+
+  // Active chat title for header
+  const activeConversation = conversations.find((c) => c.id === activeConvId);
+  const activeChatTitle = activeConversation ? activeConversation.title : "New chat";
 
   return (
-    <div className="app-layout">
+    <div className="app-container">
+      {/* Mobile top bar with hamburger menu */}
+      <div className="mobile-topbar">
+        <button
+          className="hamburger-btn"
+          onClick={() => setSidebarOpen((prev) => !prev)}
+          aria-label="Toggle navigation"
+        >
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <line x1="3" y1="12" x2="21" y2="12" />
+            <line x1="3" y1="6" x2="21" y2="6" />
+            <line x1="3" y1="18" x2="21" y2="18" />
+          </svg>
+        </button>
+        <span style={{ fontWeight: 600, fontSize: 16 }}>Research Bot</span>
+        <div style={{ width: 22 }} />
+      </div>
+
+      {/* Backdrop for mobile drawer */}
+      <div
+        className={`sidebar-backdrop ${sidebarOpen ? "open" : ""}`}
+        onClick={() => setSidebarOpen(false)}
+      />
+
       {/* Sidebar */}
-      <aside className="sidebar">
-        <div className="sidebar-header">
-          <div className="logo-badge">
-            <span className="logo-icon">📄</span>
-            <div>
-              <h2>Research Bot</h2>
-              <span className="app-subtitle">Capstone RAG System</span>
-            </div>
+      <aside className={`sidebar ${sidebarOpen ? "open" : ""}`}>
+        {/* Brand */}
+        <div className="sidebar-brand">
+          <div className="brand-icon-box">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <circle cx="12" cy="12" r="4" />
+              <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41" />
+            </svg>
           </div>
-          <button
-            id="new-chat-btn"
-            className="primary-btn new-chat-btn"
-            onClick={handleCreateNewConversation}
-          >
-            + New Chat
-          </button>
+          <span className="brand-title">Research Bot</span>
         </div>
 
-        {/* Conversations List */}
-        <div className="sidebar-section">
-          <h3>Conversations</h3>
-          <div className="conversations-list">
+        {/* Navigation Tabs */}
+        <nav className="sidebar-nav">
+          <button
+            className={`nav-item ${currentTab === "chat" ? "active" : ""}`}
+            onClick={() => {
+              setCurrentTab("chat");
+              setSidebarOpen(false);
+            }}
+          >
+            <div className="nav-item-left">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+              </svg>
+              <span>Chat</span>
+            </div>
+          </button>
+
+          <button
+            className={`nav-item ${currentTab === "files" ? "active" : ""}`}
+            onClick={() => {
+              setCurrentTab("files");
+              setSidebarOpen(false);
+            }}
+          >
+            <div className="nav-item-left">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+              </svg>
+              <span>Files</span>
+            </div>
+            <span className="nav-badge">{files.length}</span>
+          </button>
+        </nav>
+
+        {/* + New Chat Button */}
+        <button className="new-chat-button" onClick={handleNewChat}>
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+            <line x1="12" y1="5" x2="12" y2="19" />
+            <line x1="5" y1="12" x2="19" y2="12" />
+          </svg>
+          <span>New chat</span>
+        </button>
+
+        {/* History Section */}
+        <div className="history-section">
+          <div className="history-header">HISTORY</div>
+          <div className="history-list">
             {conversations.length === 0 ? (
-              <p className="empty-text">No conversations yet.</p>
+              <div className="history-empty-text">No previous chats</div>
             ) : (
               conversations.map((c) => (
                 <div
                   key={c.id}
-                  id={`conv-item-${c.id}`}
-                  className={`conversation-item ${c.id === activeConvId ? "active" : ""}`}
-                  onClick={() => setActiveConvId(c.id)}
+                  className={`history-item ${c.id === activeConvId ? "active" : ""}`}
+                  onClick={() => handleSelectConversation(c)}
                 >
-                  <span className="conv-title" title={c.title}>
-                    💬 {c.title || `Chat #${c.id}`}
-                  </span>
-                  <button
-                    className="delete-icon-btn"
-                    title="Delete conversation"
-                    onClick={(e) => handleDeleteConversation(c.id, e)}
-                  >
-                    ×
-                  </button>
-                </div>
-              ))
-            )}
-          </div>
-        </div>
-
-        {/* Uploaded Documents List */}
-        <div className="sidebar-section documents-section">
-          <div className="section-title-row">
-            <h3>Uploaded Papers ({documents.length})</h3>
-          </div>
-          <div className="documents-list">
-            {documents.length === 0 ? (
-              <p className="empty-text">No research papers uploaded yet.</p>
-            ) : (
-              documents.map((doc) => (
-                <div key={doc.id} className="doc-item" id={`doc-item-${doc.id}`}>
-                  <div className="doc-info">
-                    <span className="doc-name" title={doc.original_filename}>
-                      {doc.original_filename}
+                  <div className="history-item-left">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+                    </svg>
+                    <span className="history-item-title" title={c.title}>
+                      {c.title || "Untitled chat"}
                     </span>
-                    <div className="doc-meta-tags">
-                      <span className={`status-badge ${doc.status}`}>
-                        {doc.status}
-                      </span>
-                      {doc.page_count && (
-                        <span className="meta-tag">{doc.page_count} pages</span>
-                      )}
-                    </div>
                   </div>
                   <button
-                    className="delete-icon-btn"
-                    title="Delete document"
-                    onClick={() => handleDeleteDocument(doc.id)}
+                    className="history-delete-btn"
+                    title="Delete chat"
+                    onClick={(e) => handleDeleteConversation(c.id, e)}
                   >
-                    ×
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <line x1="18" y1="6" x2="6" y2="18" />
+                      <line x1="6" y1="6" x2="18" y2="18" />
+                    </svg>
                   </button>
                 </div>
               ))
@@ -324,225 +414,328 @@ function App() {
           </div>
         </div>
 
-        {/* Backend Status Footer */}
+        {/* Ready indicator footer */}
         <div className="sidebar-footer">
-          <div className="health-status">
-            <span
-              className={`health-dot ${backendStatus?.status === "ok" ? "online" : "offline"}`}
-            />
-            <span>
-              Backend: <strong>{backendStatus?.status || "Checking..."}</strong>
-            </span>
+          <div className="ready-status-row">
+            <span className="ready-dot" />
+            <span>{refreshedCount} files ready to search</span>
           </div>
-          <button className="text-link-btn" onClick={checkBackend}>
-            Refresh
-          </button>
         </div>
       </aside>
 
       {/* Main Workspace */}
-      <main className="main-content">
-        {/* Top Navbar */}
-        <header className="top-nav">
-          <div>
-            <h1>Research Paper Answer Bot</h1>
-            <p>
-              Retrieval-Augmented Generation with page-aware citations and Groq LLM
-            </p>
-          </div>
-        </header>
-
-        {/* PDF Upload Card */}
-        <section className="upload-banner-card" id="upload-section">
-          <div className="upload-card-content">
-            <div className="upload-instructions">
-              <h3>Upload Research Paper</h3>
-              <p>
-                Upload a research PDF. It will be stored locally, parsed page-by-page,
-                chunked with page numbers, and indexed in ChromaDB.
-              </p>
+      <main className="main-workspace">
+        {/* ===================================================================
+            SCREEN 1: CHAT SCREEN
+           =================================================================== */}
+        {currentTab === "chat" && (
+          <div className="chat-screen">
+            {/* Top header */}
+            <div className="chat-header">
+              <h1 className="chat-title">{activeChatTitle}</h1>
+              <div className="chat-subtitle">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                  <polyline points="14 2 14 8 20 8" />
+                  <line x1="16" y1="13" x2="8" y2="13" />
+                  <line x1="16" y1="17" x2="8" y2="17" />
+                  <polyline points="10 9 9 9 8 9" />
+                </svg>
+                <span>Answering from {refreshedCount} refreshed files</span>
+              </div>
             </div>
 
-            <div className="upload-action-row">
-              <input
-                id="pdf-file-input"
-                type="file"
-                accept=".pdf,application/pdf"
-                onChange={(e) => setFile(e.target.files?.[0] || null)}
-                disabled={isUploading}
-              />
-              <button
-                id="upload-btn"
-                className="primary-btn"
-                onClick={uploadFile}
-                disabled={!file || isUploading}
-              >
-                {isUploading ? "Processing..." : "Upload & Index PDF"}
-              </button>
-            </div>
-          </div>
-
-          {uploadStatus && (
-            <div
-              className={`upload-alert ${
-                uploadStatus.includes("failed") || uploadStatus.includes("Error")
-                  ? "alert-error"
-                  : "alert-info"
-              }`}
-            >
-              {uploadStatus}
-            </div>
-          )}
-        </section>
-
-        {/* Chat Stream & Interaction */}
-        <section className="chat-container">
-          <div className="messages-stream">
-            {messages.length === 0 ? (
-              <div className="empty-chat-placeholder">
-                <div className="welcome-card">
-                  <h2>Welcome to Research Paper Answer Bot</h2>
-                  <p>
-                    Ask questions grounded in the context of your uploaded papers.
-                    Every answer is strictly supported with Top-3 source citations
-                    including Paper Title, Page Number, and Relevance Score.
+            {/* Messages Scroll Area */}
+            <div className="chat-messages-container">
+              {messages.length === 0 ? (
+                <div className="chat-empty-state">
+                  <div className="empty-state-icon-box">
+                    <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <rect x="3" y="11" width="18" height="10" rx="3" />
+                      <circle cx="12" cy="5" r="2" />
+                      <path d="M12 7v4" />
+                      <line x1="8" y1="16" x2="8.01" y2="16" strokeWidth="3" strokeLinecap="round" />
+                      <line x1="16" y1="16" x2="16.01" y2="16" strokeWidth="3" strokeLinecap="round" />
+                    </svg>
+                  </div>
+                  <h2 className="empty-state-title">Ask something about your files</h2>
+                  <p className="empty-state-desc">
+                    Questions are answered only from PDFs marked "Refreshed" in the Files tab.
                   </p>
-                  <div className="suggested-queries">
-                    <h4>Sample Research Questions:</h4>
-                    <div className="query-pills">
-                      {sampleQuestions.map((sq, i) => (
-                        <button
-                          key={i}
-                          className="query-pill"
-                          onClick={() => {
-                            setQuestion(sq);
-                          }}
-                        >
-                          {sq}
-                        </button>
-                      ))}
+                </div>
+              ) : (
+                messages.map((msg) => (
+                  <div
+                    key={msg.id}
+                    className={`chat-message-row ${msg.role === "user" ? "user-row" : "assistant-row"}`}
+                  >
+                    {msg.role === "assistant" && (
+                      <div className="message-avatar-box assistant-avatar">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <rect x="3" y="11" width="18" height="10" rx="3" />
+                          <circle cx="12" cy="5" r="2" />
+                          <path d="M12 7v4" />
+                          <line x1="8" y1="16" x2="8.01" y2="16" strokeWidth="3" strokeLinecap="round" />
+                          <line x1="16" y1="16" x2="16.01" y2="16" strokeWidth="3" strokeLinecap="round" />
+                        </svg>
+                      </div>
+                    )}
+
+                    <div className={`message-bubble ${msg.role === "user" ? "user-bubble" : "assistant-bubble"}`}>
+                      <div className="message-content">
+                        <ReactMarkdown>{msg.content}</ReactMarkdown>
+                      </div>
                     </div>
+                  </div>
+                ))
+              )}
+
+              {/* Thinking / Loading indicator */}
+              {isThinking && (
+                <div className="chat-message-row assistant-row">
+                  <div className="message-avatar-box assistant-avatar">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <rect x="3" y="11" width="18" height="10" rx="3" />
+                      <circle cx="12" cy="5" r="2" />
+                      <path d="M12 7v4" />
+                    </svg>
+                  </div>
+                  <div className="message-bubble assistant-bubble" style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                    <div className="typing-dots">
+                      <span />
+                      <span />
+                      <span />
+                    </div>
+                    <span style={{ fontSize: 13.5, color: "var(--text-muted)" }}>
+                      Searching refreshed documents & generating answer...
+                    </span>
                   </div>
                 </div>
-              </div>
-            ) : (
-              messages.map((msg) => (
-                <div
-                  key={msg.id}
-                  className={`message-row ${msg.role === "user" ? "user-row" : "assistant-row"}`}
+              )}
+
+              <div ref={messagesEndRef} />
+            </div>
+
+            {/* Bottom floating composer */}
+            <div className="chat-input-wrapper">
+              <form className="chat-input-card" onSubmit={handleSendQuestion}>
+                <input
+                  className="chat-input-field"
+                  type="text"
+                  placeholder="Ask a question about your uploaded PDFs..."
+                  value={question}
+                  onChange={(e) => setQuestion(e.target.value)}
+                  disabled={isThinking}
+                />
+                <button
+                  type="submit"
+                  className="chat-send-btn"
+                  disabled={!question.trim() || isThinking}
+                  title="Send message"
                 >
-                  <div className="message-avatar">
-                    {msg.role === "user" ? "👤" : "🤖"}
+                  <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.3">
+                    <line x1="22" y1="2" x2="11" y2="13" />
+                    <polygon points="22 2 15 22 11 13 2 9 22 2" />
+                  </svg>
+                </button>
+              </form>
+            </div>
+          </div>
+        )}
+
+        {/* ===================================================================
+            SCREEN 2: FILES SCREEN
+           =================================================================== */}
+        {currentTab === "files" && (
+          <div className="files-screen">
+            {/* Header */}
+            <div className="files-header">
+              <h1 className="files-title">Your files</h1>
+              <p className="files-subtitle">Upload PDFs to make them searchable in chat</p>
+            </div>
+
+            {/* Upload Dropzone */}
+            <div
+              className={`upload-dropzone ${isDragging ? "dragging" : ""}`}
+              onClick={() => fileInputRef.current?.click()}
+              onDragOver={(e) => {
+                e.preventDefault();
+                setIsDragging(true);
+              }}
+              onDragLeave={() => setIsDragging(false)}
+              onDrop={(e) => {
+                e.preventDefault();
+                setIsDragging(false);
+                if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+                  handleFileSelect(e.dataTransfer.files[0]);
+                }
+              }}
+            >
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".pdf,application/pdf"
+                style={{ display: "none" }}
+                onChange={(e) => {
+                  if (e.target.files && e.target.files[0]) {
+                    handleFileSelect(e.target.files[0]);
+                  }
+                }}
+              />
+              <div className="upload-icon-box">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                  <polyline points="17 8 12 3 7 8" />
+                  <line x1="12" y1="3" x2="12" y2="15" />
+                </svg>
+              </div>
+              <span className="upload-prompt-text">
+                {isUploading ? "Uploading PDF..." : "Drop a PDF here, or click to browse"}
+              </span>
+              <span className="upload-prompt-subtext">
+                Files are refreshed only when you click Refresh to index for chat
+              </span>
+            </div>
+
+            {/* Alert / Feedback Banner */}
+            {uploadFeedback && (
+              <div className={`alert-banner alert-${uploadFeedback.type}`}>
+                <span>{uploadFeedback.message}</span>
+                <button
+                  style={{ background: "none", border: "none", cursor: "pointer", color: "inherit", fontWeight: 700 }}
+                  onClick={() => setUploadFeedback(null)}
+                >
+                  ✕
+                </button>
+              </div>
+            )}
+
+            {/* All Files Table */}
+            <div className="files-table-section">
+              <h2 className="files-section-title">All files</h2>
+
+              <div className="files-table-container">
+                {files.length === 0 ? (
+                  <div className="empty-files-placeholder">
+                    No PDF documents uploaded yet. Drop a PDF above to get started.
                   </div>
-                  <div className="message-bubble">
-                    <div className="message-header">
-                      <span className="sender-name">
-                        {msg.role === "user" ? "You" : "Research Assistant"}
-                      </span>
-                      <span className="message-time">
-                        {new Date(msg.created_at).toLocaleTimeString([], {
-                          hour: "2-digit",
-                          minute: "2-digit",
-                        })}
-                      </span>
-                    </div>
+                ) : (
+                  <table className="files-table">
+                    <thead>
+                      <tr>
+                        <th>Name</th>
+                        <th>Status</th>
+                        <th style={{ textAlign: "right", paddingRight: 32 }}>Action</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {files.map((file) => {
+                        const isRefreshing = refreshingIds.has(file.id) || file.status === "refreshing";
+                        const isRefreshed = file.status === "refreshed" || file.status === "completed";
+                        const isFailed = file.status === "failed";
+                        const isNotRefreshed = !isRefreshed && !isRefreshing && !isFailed;
 
-                    <div className="message-text">
-                      <ReactMarkdown>{msg.content}</ReactMarkdown>
-                    </div>
-
-                    {/* Top-3 Sources Display */}
-                    {msg.sources && msg.sources.length > 0 && (
-                      <div className="sources-container" id="sources-display">
-                        <div className="sources-header">
-                          <span className="sources-icon">📚</span>
-                          <h4>Top {msg.sources.length} Cited Sources</h4>
-                        </div>
-
-                        <div className="sources-grid">
-                          {msg.sources.slice(0, 3).map((source, sIdx) => (
-                            <div
-                              className="source-card"
-                              key={sIdx}
-                              id={`source-card-${sIdx + 1}`}
-                            >
-                              <div className="source-rank-badge">
-                                Rank #{source.rank || sIdx + 1}
-                              </div>
-                              <div className="source-details">
-                                <h5 className="source-paper-title" title={source.paper_title}>
-                                  {source.paper_title || "Research Paper"}
-                                </h5>
-                                <div className="source-meta-row">
-                                  <span className="source-page-tag">
-                                    Page {source.page_number ?? "N/A"}
+                        return (
+                          <tr key={file.id}>
+                            {/* File Name & Size */}
+                            <td>
+                              <div className="file-info-cell">
+                                <div className={`file-icon-box ${isRefreshed ? "" : "doc-unrefreshed"}`}>
+                                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                                    <polyline points="14 2 14 8 20 8" />
+                                  </svg>
+                                </div>
+                                <div className="file-meta-col">
+                                  <span className="file-name-text" title={file.original_filename}>
+                                    {file.original_filename}
                                   </span>
-                                  <span className="source-score-tag">
-                                    Relevance:{" "}
-                                    <strong>
-                                      {source.score != null
-                                        ? Number(source.score).toFixed(4)
-                                        : "N/A"}
-                                    </strong>
+                                  <span className="file-size-text">
+                                    {formatBytes(file.file_size)}
+                                    {file.page_count ? ` • ${file.page_count} pages` : ""}
                                   </span>
                                 </div>
                               </div>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              ))
-            )}
+                            </td>
 
-            {loading && (
-              <div className="message-row assistant-row">
-                <div className="message-avatar">🤖</div>
-                <div className="message-bubble loading-bubble">
-                  <div className="typing-indicator">
-                    <span />
-                    <span />
-                    <span />
-                  </div>
-                  <span className="loading-text">
-                    Retrieving research chunks & generating grounded answer...
-                  </span>
-                </div>
+                            {/* Status Badge */}
+                            <td>
+                              {isRefreshed && (
+                                <span className="status-pill refreshed">
+                                  <span className="status-dot" />
+                                  Refreshed
+                                </span>
+                              )}
+                              {isNotRefreshed && (
+                                <span className="status-pill not_refreshed">
+                                  <span className="status-dot" />
+                                  Not refreshed
+                                </span>
+                              )}
+                              {isRefreshing && (
+                                <span className="status-pill refreshing">
+                                  <span className="status-spinner" />
+                                  Refreshing...
+                                </span>
+                              )}
+                              {isFailed && (
+                                <span className="status-pill failed">
+                                  <span className="status-dot" />
+                                  Failed
+                                </span>
+                              )}
+                            </td>
+
+                            {/* Action Buttons */}
+                            <td className="action-cell">
+                              <div className="table-actions" style={{ justifyContent: "flex-end" }}>
+                                <button
+                                  className="refresh-btn"
+                                  onClick={() => handleRefresh(file.id)}
+                                  disabled={isRefreshing}
+                                  title="Index or re-index file into ChromaDB"
+                                >
+                                  <svg
+                                    width="14"
+                                    height="14"
+                                    viewBox="0 0 24 24"
+                                    fill="none"
+                                    stroke="currentColor"
+                                    strokeWidth="2"
+                                    className={isRefreshing ? "status-spinner" : ""}
+                                  >
+                                    <polyline points="23 4 23 10 17 10" />
+                                    <polyline points="1 20 1 14 7 14" />
+                                    <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
+                                  </svg>
+                                  <span>{isRefreshing ? "Refreshing..." : "Refresh"}</span>
+                                </button>
+
+                                <button
+                                  className="delete-btn"
+                                  onClick={() => handleDeleteFile(file.id)}
+                                  title="Delete document and remove vectors"
+                                >
+                                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                    <polyline points="3 6 5 6 21 6" />
+                                    <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                                    <line x1="10" y1="11" x2="10" y2="17" />
+                                    <line x1="14" y1="11" x2="14" y2="17" />
+                                  </svg>
+                                </button>
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                )}
               </div>
-            )}
-            <div ref={messagesEndRef} />
+            </div>
           </div>
-
-          {/* Chat Input Bar */}
-          <form className="chat-input-bar" onSubmit={askQuestion}>
-            <textarea
-              id="question-input"
-              value={question}
-              onChange={(e) => setQuestion(e.target.value)}
-              placeholder="Ask a question about the uploaded research papers (e.g., What is the role of attention?)..."
-              rows={2}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault();
-                  askQuestion();
-                }
-              }}
-            />
-            <button
-              id="send-question-btn"
-              type="submit"
-              className="primary-btn send-btn"
-              disabled={loading || !question.trim()}
-            >
-              {loading ? "Searching..." : "Ask Question"}
-            </button>
-          </form>
-        </section>
+        )}
       </main>
     </div>
   );
 }
-
-export default App;

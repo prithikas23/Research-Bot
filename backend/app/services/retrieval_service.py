@@ -37,6 +37,7 @@ class RetrievalService:
         query: str,
         top_k: int | None = None,
         top_sources: int | None = None,
+        allowed_document_ids: set[int] | list[int] | None = None,
     ) -> tuple[list[str], list[dict]]:
         """
         Execute dense search and return:
@@ -63,10 +64,15 @@ class RetrievalService:
 
         candidates = []
         for doc_text, meta, dist in zip(documents, metadatas, distances):
+            meta_dict = meta or {}
+            doc_id = int(meta_dict.get("document_id", 0))
+            if allowed_document_ids is not None and doc_id not in allowed_document_ids:
+                continue
+
             score = self.distance_to_score(dist)
             candidates.append({
                 "text": doc_text,
-                "metadata": meta or {},
+                "metadata": meta_dict,
                 "score": score,
                 "distance": dist,
             })

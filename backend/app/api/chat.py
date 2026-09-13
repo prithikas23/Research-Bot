@@ -11,6 +11,7 @@ from app.models.document import Document
 from app.schemas.chat import ChatRequest, ChatResponse, SourceItem
 from app.services.retrieval_service import retrieval_service
 from app.services.llm_service import llm_service
+from app.services.greeting_service import detect_greeting
 
 logger = logging.getLogger(__name__)
 
@@ -68,23 +69,47 @@ def chat(payload: ChatRequest, db: Session = Depends(get_db)):
     )
     conversation_history = [{"role": m.role, "content": m.content} for m in recent_messages]
 
-    # 4. Retrieve research paper context from ChromaDB
-    try:
-        context_chunks, raw_sources = retrieval_service.retrieve(query=question)
-    except Exception as e:
-        logger.error(f"Retrieval error: {e}", exc_info=True)
-        context_chunks, raw_sources = [], []
-
-    # 5. Generate grounded answer with Groq LLM
-    try:
-        answer = llm_service.generate_answer(
-            query=question,
-            context_chunks=context_chunks,
-            conversation_history=conversation_history,
+    # 4. Check for greeting-only or identity queries first (no RAG, no ChromaDB)
+    greeting_answer = detect_greeting(question)
+    if greeting_answer:
+        answer = greeting_answer
+        raw_sources = []
+    else:
+        # Check for refreshed/completed documents
+        refreshed_docs = (
+            db.query(Document.id)
+            .filter(Document.status.in_(["refreshed", "completed"]))
+            .all()
         )
-    except Exception as e:
-        logger.error(f"LLM generation error: {e}", exc_info=True)
-        answer = "An error occurred while generating the answer from the research papers. Please try again."
+        refreshed_ids = {d[0] for d in refreshed_docs}
+
+        if not refreshed_ids:
+            context_chunks, raw_sources = [], []
+            answer = (
+                "No refreshed documents are currently indexed for search. "
+                "Please go to the **Files** tab, upload a PDF, and click **Refresh** to make it searchable."
+            )
+        else:
+            # Retrieve research paper context strictly from refreshed documents
+            try:
+                context_chunks, raw_sources = retrieval_service.retrieve(
+                    query=question,
+                    allowed_document_ids=refreshed_ids,
+                )
+            except Exception as e:
+                logger.error(f"Retrieval error: {e}", exc_info=True)
+                context_chunks, raw_sources = [], []
+
+            # 5. Generate grounded answer with Groq LLM
+            try:
+                answer = llm_service.generate_answer(
+                    query=question,
+                    context_chunks=context_chunks,
+                    conversation_history=conversation_history,
+                )
+            except Exception as e:
+                logger.error(f"LLM generation error: {e}", exc_info=True)
+                answer = "An error occurred while generating the answer from the research papers. Please try again."
 
     # 6. Save assistant message
     assistant_msg = Message(

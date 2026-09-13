@@ -9,7 +9,8 @@ from app.api.chat import router as chat_router
 router = APIRouter()
 
 # Include sub-routers
-router.include_router(documents_router)
+router.include_router(documents_router, prefix="/documents", tags=["documents"])
+router.include_router(documents_router, prefix="/files", tags=["files"])
 router.include_router(conversations_router)
 router.include_router(chat_router)
 
